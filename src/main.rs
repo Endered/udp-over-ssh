@@ -86,8 +86,8 @@ impl<'a> Sender<'a> {
 
 async fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let socket;
-    let mut sender;
-    let mut reciever;
+    let sender;
+    let reciever;
 
     match config {
         Config::Send(target) => {
