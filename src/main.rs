@@ -60,7 +60,12 @@ impl<'a> Sender<'a> {
     }
 
     async fn set_target(&self, target: SocketAddr) -> Result<(), Box<dyn Error>> {
-        *self.target.lock().await = Some(target);
+        {
+            let mut otarget = self.target.lock().await;
+            if otarget.is_none() {
+                *otarget = Some(target)
+            }
+        }
         self.flush().await
     }
 
