@@ -1,145 +1,126 @@
+use std::collections::HashMap;
 use std::env::args;
 use std::error::Error;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use async_std::net::{ToSocketAddrs, UdpSocket};
+use async_std::io::WriteExt;
+use async_std::net::UdpSocket;
 use async_std::sync::Mutex;
 use async_std::{io, task};
 use base64::Engine;
 
 use futures::try_join;
 
-struct Reciever<'a> {
-    socket: &'a UdpSocket,
-    target: Mutex<Option<SocketAddr>>,
-}
-
-impl<'a> Reciever<'a> {
-    fn new(socket: &'a UdpSocket) -> Self {
-        Reciever {
-            socket,
-            target: Mutex::new(None),
-        }
-    }
-
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        loop {
-            let (len, addr) = self.socket.recv_from(buf).await?;
-            let mut target = self.target.lock().await;
-            if target.is_none() {
-                *target = Some(addr);
-            }
-            if *target == Some(addr) {
-                return Ok((len, addr));
-            }
-        }
-    }
-}
-
-struct Sender<'a> {
-    socket: &'a UdpSocket,
-    target: Mutex<Option<SocketAddr>>,
-    buffer: Mutex<Vec<Vec<u8>>>,
-}
-
-impl<'a> Sender<'a> {
-    fn new(socket: &'a UdpSocket) -> Self {
-        Sender {
-            socket,
-            target: Mutex::new(None),
-            buffer: Mutex::new(vec![]),
-        }
-    }
-
-    fn new_with_target(socket: &'a UdpSocket, target: SocketAddr) -> Self {
-        Sender {
-            socket,
-            target: Mutex::new(Some(target)),
-            buffer: Mutex::new(vec![]),
-        }
-    }
-
-    async fn set_target(&self, target: SocketAddr) -> Result<(), Box<dyn Error>> {
-        {
-            let mut otarget = self.target.lock().await;
-            if otarget.is_none() {
-                *otarget = Some(target)
-            }
-        }
-        self.flush().await
-    }
-
-    async fn send(&self, buf: &[u8]) -> Result<(), Box<dyn Error>> {
-        self.buffer.lock().await.push(buf.to_vec());
-        self.flush().await
-    }
-
-    async fn flush(&self) -> Result<(), Box<dyn Error>> {
-        if let Some(target) = *self.target.lock().await {
-            let mut buffer = self.buffer.lock().await;
-            for buf in &*buffer {
-                let len = self.socket.send_to(buf, target).await?;
-                if len != buf.len() {
-                    return Err("Packet boundary was broken".into());
-                }
-            }
-            buffer.clear();
-        }
-        Ok(())
-    }
-}
-
-async fn run(config: Config) -> Result<(), Box<dyn Error>> {
-    let socket;
-    let sender;
-    let reciever;
-
-    match config {
-        Config::Send(target) => {
-            socket = UdpSocket::bind("0.0.0.0:0").await?;
-            let [target, ..] = target.to_socket_addrs().await?.collect::<Vec<_>>()[..] else {
-                return Err(format!("Failed to resolve target: {target}").into());
-            };
-            sender = Sender::new_with_target(&socket, target);
-            reciever = Reciever::new(&socket);
-        }
-        Config::Listen(port) => {
-            socket = UdpSocket::bind(format!("0.0.0.0:{port}")).await?;
-            sender = Sender::new(&socket);
-            reciever = Reciever::new(&socket);
-        }
+fn parse(s: &str) -> Result<(usize, Vec<u8>), Box<dyn Error>> {
+    let s: String = s.chars().filter(|c| c != &'\n' && c != &' ').collect();
+    let [id, data] = s.split(':').collect::<Vec<_>>()[..] else {
+        return Err(format!("Invalid format: {s}").into());
     };
 
-    async fn sender_task(sender: &Sender<'_>) -> Result<(), Box<dyn Error>> {
-        loop {
-            let mut tmp = String::new();
-            io::stdin().read_line(&mut tmp).await?;
-            tmp.pop();
-            for token in tmp.split_whitespace() {
-                let s = base64::prelude::BASE64_STANDARD.decode(&token)?;
-                sender.send(&s).await?;
+    let id = id.parse()?;
+    let data = data
+        .chars()
+        .filter(|c| c != &'\n' && c != &' ')
+        .collect::<String>();
+    let data = base64::prelude::BASE64_STANDARD.decode(data)?;
+
+    Ok((id, data))
+}
+
+async fn run_send(target: String) -> Result<(), Box<dyn Error>> {
+    let mut clients = HashMap::<usize, Arc<UdpSocket>>::new();
+    let output = Arc::new(Mutex::new(io::stdout()));
+
+    loop {
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf).await?;
+        let (id, data) = parse(&buf)?;
+        let socket = if let Some(socket) = clients.get(&id) {
+            socket.clone()
+        } else {
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            let socket = Arc::new(socket);
+            clients.insert(id, socket.clone());
+            {
+                let output = output.clone();
+                let socket = socket.clone();
+                task::spawn(async move {
+                    let mut buf = [0u8; 65535];
+                    loop {
+                        let len = socket.recv(&mut buf).await.unwrap();
+                        let encoded = base64::prelude::BASE64_STANDARD.encode(&buf[..len]);
+                        let data = format!("{id}:{encoded}\n");
+                        let mut output = output.lock().await;
+                        output.write_all(data.as_bytes()).await.unwrap();
+                        output.flush().await.unwrap();
+                    }
+                });
             }
+            socket
+        };
+        socket.send_to(&data, &target).await.unwrap();
+    }
+}
+
+async fn run_listen(port: u16) -> Result<(), Box<dyn Error>> {
+    let socket = UdpSocket::bind(format!("0.0.0.0:{port}")).await?;
+
+    struct AdddresManager {
+        addr2id: HashMap<SocketAddr, usize>,
+        id2addr: HashMap<usize, SocketAddr>,
+    }
+
+    let clients = Mutex::new(AdddresManager {
+        addr2id: HashMap::new(),
+        id2addr: HashMap::new(),
+    });
+
+    async fn send_task(
+        socket: &UdpSocket,
+        clients: &Mutex<AdddresManager>,
+    ) -> Result<(), Box<dyn Error>> {
+        let stdin = io::stdin();
+
+        loop {
+            let mut buf = String::new();
+            stdin.read_line(&mut buf).await?;
+            let (id, data) = parse(&buf)?;
+            let addr = clients.lock().await.id2addr.get(&id).unwrap().clone();
+            socket.send_to(&data, addr).await?;
         }
     }
 
-    async fn reciever_task(
-        sender: &Sender<'_>,
-        reciever: &Reciever<'_>,
+    async fn recv_task(
+        socket: &UdpSocket,
+        clients: &Mutex<AdddresManager>,
     ) -> Result<(), Box<dyn Error>> {
         let mut buf = [0u8; 65535];
-        loop {
-            let (len, addr) = reciever.recv(&mut buf).await.unwrap();
-            sender.set_target(addr).await?;
+        let mut stdout = io::stdout();
 
-            let x = base64::prelude::BASE64_STANDARD.encode(&buf[..len]);
-            println!("{x}");
+        loop {
+            let (len, addr) = socket.recv_from(&mut buf).await?;
+
+            let id = {
+                let mut clients = clients.lock().await;
+                if let Some(id) = clients.addr2id.get(&addr) {
+                    *id
+                } else {
+                    let new_id = clients.addr2id.len();
+                    clients.addr2id.insert(addr, new_id);
+                    clients.id2addr.insert(new_id, addr);
+                    new_id
+                }
+            };
+
+            let encoded = base64::prelude::BASE64_STANDARD.encode(&buf[..len]);
+            let output = format!("{id}:{encoded}\n");
+            stdout.write_all(output.as_bytes()).await?;
+            stdout.flush().await?;
         }
     }
 
-    let task1 = sender_task(&sender);
-    let task2 = reciever_task(&sender, &reciever);
-
-    try_join!(task1, task2)?;
+    try_join!(send_task(&socket, &clients), recv_task(&socket, &clients))?;
 
     Ok(())
 }
@@ -154,7 +135,7 @@ fn parse_config(args: Vec<String>) -> Result<Config, String> {
 
     let Some(kind) = args.get(1) else {
         return Err(format!(
-            "Please call with 2 arguments: {this} listen 8080 / {this} send 192.168.0.1:8080"
+            "Please call with 2 arguments: {this} listen 8080 or {this} send 192.168.0.1:8080"
         )
         .into());
     };
@@ -186,7 +167,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let config = parse_config(args)?;
 
-    task::block_on(run(config))?;
+    match config {
+        Config::Listen(port) => task::block_on(run_listen(port)).unwrap(),
+        Config::Send(target) => task::block_on(run_send(target)).unwrap(),
+    };
 
     Ok(())
 }
