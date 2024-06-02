@@ -1,6 +1,6 @@
 [package]
 name = "udp-over-ssh"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = [ "Endered" ]
 description = "udp tunneling over ssh"
